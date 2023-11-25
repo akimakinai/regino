@@ -1,0 +1,27 @@
+[package]
+name = "regino"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bevy = "0.12.0"
+bevy_xpbd_3d = { version = "0.3.1" }
+bevy-tnua-xpbd3d = "0.1.0"
+
+bevy_gltf_components = "0.2"
+bevy-debug-text-overlay = "7.0.0"
+bevy_framepace = "0.14.1"
+bevy-tnua = "0.13.0"
+leafwing-input-manager = "0.11.1"
+smooth-bevy-cameras = "0.10.0"
+bevy-inspector-egui = "0.21.0"
+
+[dev-dependencies]
+bevy = { features = ["file_watcher"], version = "0.12.0" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
