@@ -1,3 +1,4 @@
+use bevy::ecs::system::EntityCommands;
 use bevy::prelude::*;
 use bevy_debug_text_overlay::screen_print;
 use bevy_tnua::{builtins::TnuaBuiltinWalk, controller::TnuaController, TnuaUserControlsSystemSet};
@@ -5,6 +6,8 @@ use bevy_tnua::{control_helpers::TnuaCrouchEnforcerPlugin, prelude::*};
 use bevy_tnua_xpbd3d::*;
 use bevy_xpbd_3d::prelude::*;
 use leafwing_input_manager::prelude::*;
+use seldom_state::prelude::*;
+use seldom_state::trigger::AndTrigger;
 use smooth_bevy_cameras::{LookTransform, LookTransformBundle, LookTransformPlugin, Smoother};
 
 use crate::terrain::Ladder;
@@ -18,16 +21,17 @@ impl Plugin for PlayerPlugin {
         build_movement(app);
         build_player_camera(app);
 
+        app.add_plugins(StateMachinePlugin::default());
+        app.add_event::<LadderInteractionBeginEvent>()
+            .add_event::<LadderInteractionEndEvent>();
+        // Required to apply LinearVelocity
         app.add_systems(
             Update,
-            (
-                player_interaction,
-                (added_player_walking, added_player_moving_on_ladder),
-                apply_deferred,
-            )
-                .chain()
+            apply_deferred
+                .after(seldom_state::set::StateSet::Transition)
                 .before(TnuaPipelineStages::Motors),
         );
+        app.add_systems(Update, player_interaction);
     }
 }
 
@@ -61,54 +65,29 @@ fn build_player_add(app: &mut App) {
     app.add_systems(Update, add_player);
 }
 
-#[derive(Component)]
-struct PlayerWalking;
+#[derive(Component, Clone, Debug)]
+struct PlayerGrounded;
 
-fn added_player_walking(
-    mut commands: Commands,
-    mut player: Query<(Entity, &mut RigidBody), (Added<PlayerWalking>, Without<TnuaController>)>,
-) {
-    for (entity, mut rigid_body) in player.iter_mut() {
-        rigid_body.set_if_neq(RigidBody::Dynamic);
-        commands
-            .entity(entity)
-            .insert(TnuaControllerBundle::default());
-    }
-}
+#[derive(Component, Clone, Debug)]
+struct PlayerJumping;
 
-#[derive(Component)]
+#[derive(Component, Clone, Debug)]
 struct PlayerMovingOnLadder {
-    ladder_normal: Vec3,
-    ladder_top: Vec3,
-    ladder_bottom: Vec3,
+    face_normal: Vec3,
+    top: Vec3,
+    bottom: Vec3,
 }
 
-fn added_player_moving_on_ladder(
-    mut commands: Commands,
-    mut player: Query<
-        (
-            Entity,
-            &mut RigidBody,
-            &mut LinearVelocity,
-            Has<TnuaController>,
-        ),
-        (With<Player>, Added<PlayerMovingOnLadder>),
-    >,
-) {
-    for (entity, mut rigid_body, mut linvel, has_controller) in player.iter_mut() {
-        rigid_body.set_if_neq(RigidBody::Kinematic);
-        linvel.0 = Vec3::ZERO;
-        if has_controller {
-            commands.entity(entity).remove::<TnuaControllerBundle>();
-        }
-    }
+#[derive(Event, Clone)]
+struct LadderInteractionBeginEvent {
+    entity: Entity,
+    face_normal: Vec3,
+    top: Vec3,
+    bottom: Vec3,
 }
 
-#[derive(Component, PartialEq, Debug)]
-enum PlayerActionState {
-    Grounded,
-    Jumping,
-}
+#[derive(Event, Clone)]
+struct LadderInteractionEndEvent(Entity);
 
 const PLAYER_HEIGHT: f32 = 1.0;
 const PLAYER_WIDTH: f32 = 1.0;
@@ -132,7 +111,7 @@ fn add_player(
             ))
             .insert(LockedAxes::new().lock_rotation_x().lock_rotation_z())
             .insert(TnuaControllerBundle::default())
-            .insert((PlayerActionState::Grounded, PlayerWalking))
+            .insert(player_state_machine(entity))
             .insert((
                 meshes.add(Mesh::from(shape::Quad::new(Vec2::new(
                     PLAYER_WIDTH,
@@ -154,7 +133,80 @@ fn add_player(
                     SpatialBundle::default(),
                 ));
             });
+        add_action_state(commands.entity(entity));
     }
+}
+
+struct IsJumping;
+
+impl Trigger for IsJumping {
+    type Param<'w, 's> = Query<'w, 's, &'static TnuaController>;
+
+    type Ok = ();
+
+    type Err = ();
+
+    fn trigger(
+        &self,
+        entity: Entity,
+        query: <<Self as Trigger>::Param<'_, '_> as bevy::ecs::system::SystemParam>::Item<'_, '_>,
+    ) -> Result<Self::Ok, Self::Err> {
+        query
+            .get(entity)
+            .unwrap()
+            .concrete_action::<TnuaBuiltinJump>()
+            .map(|_| ())
+            .ok_or(())
+    }
+}
+
+fn player_state_machine(entity: Entity) -> impl Bundle {
+    let initial = PlayerGrounded;
+    let state_machine = StateMachine::default()
+        .trans::<PlayerGrounded>(JustPressedTrigger(Action::Jump), PlayerJumping)
+        .trans::<PlayerJumping>(
+            AndTrigger(IsJumping, PressedTrigger(Action::Jump)),
+            PlayerJumping,
+        )
+        .trans::<PlayerJumping>(
+            AndTrigger(IsJumping.not(), PressedTrigger(Action::Jump).not()),
+            PlayerGrounded,
+        )
+        .trans_builder::<PlayerGrounded, _, PlayerMovingOnLadder>(
+            EventTrigger::<LadderInteractionBeginEvent>::default(),
+            move |_prev, ev| {
+                if ev.entity != entity {
+                    return None;
+                }
+                Some(PlayerMovingOnLadder {
+                    face_normal: ev.face_normal,
+                    top: ev.top,
+                    bottom: ev.bottom,
+                })
+            },
+        )
+        .trans_builder::<PlayerMovingOnLadder, _, PlayerGrounded>(
+            EventTrigger::<LadderInteractionEndEvent>::default(),
+            move |_prev, ev| {
+                if ev.0 != entity {
+                    return None;
+                }
+                Some(PlayerGrounded)
+            },
+        )
+        .on_enter::<PlayerMovingOnLadder>(|entity| {
+            entity
+                .remove::<TnuaControllerBundle>()
+                .insert(RigidBody::Kinematic)
+                .insert((LinearVelocity::ZERO, AngularVelocity::ZERO));
+        })
+        .on_exit::<PlayerMovingOnLadder>(|entity| {
+            entity
+                .insert(TnuaControllerBundle::default())
+                .insert(RigidBody::Dynamic);
+        });
+
+    (initial, state_machine)
 }
 
 // Player movement
@@ -166,14 +218,9 @@ fn build_movement(app: &mut App) {
         TnuaCrouchEnforcerPlugin,
     ))
     .add_plugins(InputManagerPlugin::<Action>::default())
-    .add_systems(Update, add_action_state)
     .add_systems(
         FixedUpdate,
-        (
-            player_movement_action,
-            player_movement_walk,
-            player_movement_ladder,
-        )
+        (player_jumping, player_movement_walk, player_movement_ladder)
             .in_set(TnuaUserControlsSystemSet),
     )
     .add_systems(Update, player_animation);
@@ -189,61 +236,44 @@ enum Action {
     Interact,
 }
 
-fn add_action_state(
-    mut commands: Commands,
-    player: Query<Entity, (With<Player>, Without<ActionState<Action>>)>,
-) {
-    for entity in player.iter() {
-        commands
-            .entity(entity)
-            .insert(InputManagerBundle::<Action> {
-                action_state: default(),
-                input_map: InputMap::new([
-                    // WASD
-                    (KeyCode::W, Action::Up),
-                    (KeyCode::S, Action::Down),
-                    (KeyCode::A, Action::Left),
-                    (KeyCode::D, Action::Right),
-                    // Cursor keys
-                    (KeyCode::Up, Action::Up),
-                    (KeyCode::Down, Action::Down),
-                    (KeyCode::Left, Action::Left),
-                    (KeyCode::Right, Action::Right),
-                    // Space
-                    (KeyCode::Space, Action::Jump),
-                    // E
-                    (KeyCode::E, Action::Interact),
-                ]),
-            });
-    }
+fn add_action_state(mut entity: EntityCommands) {
+    entity.insert(InputManagerBundle::<Action> {
+        action_state: default(),
+        input_map: InputMap::new([
+            // WASD
+            (KeyCode::W, Action::Up),
+            (KeyCode::S, Action::Down),
+            (KeyCode::A, Action::Left),
+            (KeyCode::D, Action::Right),
+            // Cursor keys
+            (KeyCode::Up, Action::Up),
+            (KeyCode::Down, Action::Down),
+            (KeyCode::Left, Action::Left),
+            (KeyCode::Right, Action::Right),
+            // Space
+            (KeyCode::Space, Action::Jump),
+            // E
+            (KeyCode::E, Action::Interact),
+        ]),
+    });
 }
 
-fn player_movement_action(
+fn player_jumping(
     mut player: Query<
         (
+            Ref<PlayerJumping>,
             &ActionState<Action>,
             &mut TnuaController,
-            &mut PlayerActionState,
         ),
-        With<Player>,
+        (With<Player>, With<PlayerJumping>),
     >,
 ) {
-    for (input, mut controller, mut action_state) in player.iter_mut() {
-        let jumping = controller.concrete_action::<TnuaBuiltinJump>().is_some();
-        if jumping && input.just_released(Action::Jump) {
-            *action_state = PlayerActionState::Jumping;
-        }
-        if !jumping {
-            *action_state = PlayerActionState::Grounded;
-        }
-
-        if *action_state == PlayerActionState::Grounded {
-            if input.just_pressed(Action::Jump) || (jumping && input.pressed(Action::Jump)) {
-                controller.action(TnuaBuiltinJump {
-                    height: 1.0,
-                    ..default()
-                });
-            }
+    for (jumping_state, input, mut controller) in player.iter_mut() {
+        if jumping_state.is_added() || input.pressed(Action::Jump) {
+            controller.action(TnuaBuiltinJump {
+                height: 1.0,
+                ..default()
+            });
         }
     }
 }
@@ -268,7 +298,7 @@ fn player_movement_walk(
     mut commands: Commands,
     mut player: Query<
         (Entity, &ActionState<Action>, Option<&mut TnuaController>),
-        (With<Player>, With<PlayerWalking>),
+        (With<Player>, Or<(With<PlayerGrounded>, With<PlayerJumping>)>),
     >,
 ) {
     const MOVEMENT_SPEED: f32 = 2.0;
@@ -309,7 +339,6 @@ fn player_movement_walk(
 }
 
 fn player_movement_ladder(
-    mut commands: Commands,
     mut player: Query<
         (
             Entity,
@@ -320,6 +349,7 @@ fn player_movement_ladder(
         With<Player>,
     >,
     time: Res<Time>,
+    mut ladder_end: EventWriter<LadderInteractionEndEvent>,
 ) {
     const LADDER_SPEED: f32 = 2.0;
 
@@ -327,26 +357,20 @@ fn player_movement_ladder(
         // let frac = (transform.translation.y - ladder.ladder_bottom.y)
         //     / (ladder.ladder_top.y - ladder.ladder_bottom.y);
 
-        let height = ladder.ladder_top.y - ladder.ladder_bottom.y;
-        let cur_pos = transform.translation.y - ladder.ladder_bottom.y;
+        let height = ladder.top.y - ladder.bottom.y;
+        let cur_pos = transform.translation.y - ladder.bottom.y;
 
         if input.pressed(Action::Up) {
             if cur_pos > height + PLAYER_HEIGHT / 2. {
-                commands
-                    .entity(entity)
-                    .remove::<PlayerMovingOnLadder>()
-                    .insert(PlayerWalking);
-                transform.translation -= ladder.ladder_normal * PLAYER_WIDTH * 0.8;
+                ladder_end.send(LadderInteractionEndEvent(entity));
+                transform.translation -= ladder.face_normal * PLAYER_WIDTH * 0.8;
             } else {
                 transform.translation += LADDER_SPEED * Vec3::Y * time.delta_seconds();
             }
         }
         if input.pressed(Action::Down) {
             if cur_pos < 0.1 {
-                commands
-                    .entity(entity)
-                    .remove::<PlayerMovingOnLadder>()
-                    .insert(PlayerWalking);
+                ladder_end.send(LadderInteractionEndEvent(entity));
             } else {
                 transform.translation -= LADDER_SPEED * Vec3::Y * time.delta_seconds();
             }
@@ -436,23 +460,18 @@ fn player_following_camera(
 }
 
 fn player_interaction(
-    mut commands: Commands,
     ray: Query<(&RayCaster, &RayHits, &Parent), With<InteractionRayCaster>>,
     ladders: Query<(Entity, &Ladder, &Position, &Rotation, &Collider), Without<Player>>,
-    mut player: Query<
-        (
-            Entity,
-            &ActionState<Action>,
-            Has<PlayerWalking>,
-            &mut Transform,
-        ),
-        With<Player>,
-    >,
+    mut player: Query<(&ActionState<Action>, Has<PlayerGrounded>, &mut Transform), With<Player>>,
+    mut ladder_begin: EventWriter<LadderInteractionBeginEvent>,
+    mut ladder_end: EventWriter<LadderInteractionEndEvent>,
 ) {
     for (ray, hits, parent) in &ray {
         screen_print!("hit: {:?}", hits.as_slice());
 
-        let Ok((entity, action, walking, mut transform)) = player.get_mut(parent.get()) else {
+        let player_entity = parent.get();
+
+        let Ok((action, walking, mut transform)) = player.get_mut(player_entity) else {
             error!("Player missing");
             continue;
         };
@@ -483,23 +502,19 @@ fn player_interaction(
                             center - half_height + PLAYER_HEIGHT / 2.0,
                         );
 
-                        commands.entity(entity).remove::<PlayerWalking>().insert(
-                            PlayerMovingOnLadder {
-                                ladder_normal: ladder.face_normal,
-                                ladder_top: Vec3::new(player_pos.x, top, player_pos.z),
-                                ladder_bottom: Vec3::new(player_pos.x, bottom, player_pos.z),
-                            },
-                        );
+                        ladder_begin.send(LadderInteractionBeginEvent {
+                            entity: player_entity,
+                            face_normal: ladder.face_normal,
+                            top: Vec3::new(player_pos.x, top, player_pos.z),
+                            bottom: Vec3::new(player_pos.x, bottom, player_pos.z),
+                        });
 
                         screen_print!("begin moving on ladder {ladder_entity:?}");
                         break;
                     }
                 }
             } else {
-                commands
-                    .entity(entity)
-                    .remove::<PlayerMovingOnLadder>()
-                    .insert(PlayerWalking);
+                ladder_end.send(LadderInteractionEndEvent(player_entity));
                 screen_print!("end moving on ladder");
             }
         }

@@ -17,10 +17,9 @@ use player::PlayerFollowingCamera;
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
-        // .add_plugins(OverlayPlugin::default())
-        // .add_plugins(EditorPlugin::default())
+        .add_plugins(OverlayPlugin::default())
         // .add_plugins(FramepacePlugin)
-        // .add_plugins(WorldInspectorPlugin::new())
+        .add_plugins(WorldInspectorPlugin::new())
         .add_plugins(PhysicsPlugins::default())
         // .add_plugins(PhysicsDebugPlugin::default())
         .add_plugins(regino::ReginoPlugins)
